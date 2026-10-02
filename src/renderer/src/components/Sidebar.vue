@@ -8,10 +8,10 @@ import type { Tag } from '@shared/types'
 
 const nav: { view: View; label: string; icon: string; count?: () => number; hot?: () => boolean }[] = [
   { view: 'today', label: 'Сегодня', icon: 'sun', count: () => counts.value.today, hot: () => counts.value.overdue > 0 },
+  { view: 'calendar', label: 'Календарь', icon: 'calendar' },
   { view: 'upcoming', label: 'Предстоящие', icon: 'upcoming', count: () => counts.value.upcoming },
   { view: 'inbox', label: 'Входящие', icon: 'inbox', count: () => counts.value.inbox },
   { view: 'all', label: 'Все задачи', icon: 'list' },
-  { view: 'calendar', label: 'Календарь', icon: 'calendar' },
   { view: 'done', label: 'Выполненные', icon: 'checkCircle' }
 ]
 

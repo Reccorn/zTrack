@@ -1,7 +1,7 @@
 {
   "name": "ztrack",
   "productName": "zTrack",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "zTrack — личный таск-трекер с календарём",
   "author": "zTrack",
   "private": true,

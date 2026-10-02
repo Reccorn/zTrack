@@ -1,0 +1,28 @@
+{
+  "$schema": "https://repomix.com/schemas/latest/schema.json",
+  "output": {
+    "filePath": "Claude outputs/ztrack-pack.md",
+    "style": "markdown",
+    "headerText": "zTrack — личный офлайн-трекер задач с календарём для Windows. Стек: Electron 44 + Vue 3 + TypeScript, electron-vite, electron-builder; без UI-библиотек и нативных модулей. Источник истины — main-процесс (src/main: index, store, scheduler, ai); renderer (src/renderer/src) шлёт IPC-мутации через preload, main рассылает data-changed. Общие типы и повторы — src/shared. Локальный ИИ — Ollama (src/main/ai.ts). Полное ТЗ (ТЗ.md) в пакет не входит; история версий — CHANGELOG.md.",
+    "topFilesLength": 10,
+    "patterns": [
+      {
+        "pattern": "**/*.vue",
+        "compress": false
+      }
+    ]
+  },
+  "ignore": {
+    "useGitignore": true,
+    "useDefaultPatterns": true,
+    "customPatterns": [
+      "ТЗ.md",
+      "build/**",
+      "resources/**",
+      ".gitattributes"
+    ]
+  },
+  "security": {
+    "enableSecurityCheck": true
+  }
+}

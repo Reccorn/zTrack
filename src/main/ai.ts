@@ -439,23 +439,81 @@ export function breakdown(title: string, notes: string, existing: string[]): Pro
 }
 
 // ---------- 3. Ассистент недели ----------
+//
+// Маленькая модель (E2B) плохо считает дела по списку, сама переводит даты в дни недели с ошибками
+// и пишет пояснения, которые расходятся с выбранной датой. Поэтому:
+//  - факты (сколько дел, какой день загружен) считает код, модель даёт только короткую оценку;
+//  - id задач и дни переноса ограничены enum в схеме: модель выбирает «t2» и «пн», а не пишет даты;
+//  - перенос принимается, только если он реально разгружает день (или ставит просроченное);
+//  - пояснение, где модель называет дни или даты, заменяется пояснением, собранным кодом;
+//  - на лёгкой неделе (нет загруженных дней и просрочек) переносы у модели не запрашиваются вовсе.
 
-const PLAN_SCHEMA = {
-  type: 'object',
-  properties: {
-    summary: { type: 'string' },
-    moves: {
+/** День считается загруженным, если в нём от BUSY_COUNT дел или больше BUSY_MINUTES минут */
+const BUSY_COUNT = 4
+const BUSY_MINUTES = 240
+
+/** Текст упоминает день недели или дату */
+const DAY_MENTION =
+  /понедельн|вторник|сред[аеуы](?![а-яё])|четверг|пятниц|суббот|воскресен|(?<![а-яё])(пн|вт|ср|чт|пт|сб|вс)(?![а-яё])|\d{1,2}[./]\d{1,2}|\d{4}-\d{2}/i
+/** Текст пересказывает количество дел — эти числа модель часто путает */
+const COUNT_MENTION =
+  /\d|(?<![а-яё])(одн|два|двух|две|три|трёх|трех|четыр|пять|пяти|шест|нескольк)[а-яё]*\s+(?:[а-яё]+\s+)?(задач|событ|дел)/i
+
+function plural(n: number, forms: [string, string, string]): string {
+  const a = n % 10
+  const b = n % 100
+  const f = a === 1 && b !== 11 ? forms[0] : a >= 2 && a <= 4 && (b < 12 || b > 14) ? forms[1] : forms[2]
+  return `${n} ${f}`
+}
+const DELA: [string, string, string] = ['дело', 'дела', 'дел']
+const ZADACHI: [string, string, string] = ['задача', 'задачи', 'задач']
+const SOBYTIYA: [string, string, string] = ['событие', 'события', 'событий']
+
+/** «≈1,5 ч» */
+function hrs(min: number): string {
+  return `≈${String(Math.round(min / 6) / 10).replace('.', ',')} ч`
+}
+
+/** «вт 6» — как подписи дней в интерфейсе */
+function dayName(k: string): string {
+  const d = fromKey(k)
+  return `${WD_SHORT[d.getDay()]} ${d.getDate()}`
+}
+
+/** «вт 6.10» */
+function dayFull(k: string): string {
+  const d = fromKey(k)
+  return `${dayName(k)}.${String(d.getMonth() + 1).padStart(2, '0')}`
+}
+
+function sentence(s: string): string {
+  const t = s.trim()
+  return !t || /[.!?…]$/.test(t) ? t : t + '.'
+}
+
+/** Схема ответа. Без ids — неделя лёгкая, переносы не запрашиваем (и модель не тратит на них токены). */
+function planSchema(ids: string[] | null, dayCodes: string[]): object {
+  const properties: Record<string, unknown> = { comment: { type: 'string' } }
+  const required = ['comment']
+  if (ids) {
+    properties.moves = {
       type: 'array',
       maxItems: 5,
       items: {
         type: 'object',
-        properties: { id: { type: 'string' }, to: { type: 'string' }, reason: { type: 'string' } },
+        properties: {
+          id: { type: 'string', enum: ids },
+          to: { type: 'string', enum: dayCodes },
+          reason: { type: 'string' }
+        },
         required: ['id', 'to', 'reason']
       }
-    },
-    tips: { type: 'array', items: { type: 'string' }, maxItems: 3 }
-  },
-  required: ['summary', 'moves', 'tips']
+    }
+    required.push('moves')
+  }
+  properties.tips = { type: 'array', items: { type: 'string' }, maxItems: 3 }
+  required.push('tips')
+  return { type: 'object', properties, required }
 }
 
 /** Оценка длительности: события — по времени, задачи — 30 минут */
@@ -470,96 +528,167 @@ export function planWeek(weekStart: string): Promise<AiWeekPlan> {
     const data = getData()
     const today = todayKey()
     const days = Array.from({ length: 7 }, (_, i) => addDays(weekStart, i))
-    const occs = occurrencesInRange(data.items, days[0], days[6])
+    const all = occurrencesInRange(data.items, days[0], days[6])
+    const open = all.filter((o) => !o.done)
+    const future = days.filter((k) => k >= today)
+    if (!future.length) throw new AiError('Эта неделя уже прошла — откройте текущую или следующую')
 
-    // короткие id (t1, t2…) — меньше токенов и меньше шансов, что модель исказит идентификатор
+    const overdue = data.items.filter((i) => !isRecurring(i) && i.date && i.date < today && !i.done && i.type === 'task')
+
+    // нагрузка по дням (только невыполненное)
+    const load = new Map<string, number>()
+    const count = new Map<string, number>()
+    for (const k of days) {
+      const list = open.filter((o) => o.date === k)
+      load.set(k, list.reduce((sum, o) => sum + durationOf(o.item), 0))
+      count.set(k, list.length)
+    }
+
+    // ---- факты для пользователя считаем сами ----
+    const events = all.filter((o) => o.item.type === 'event').length
+    const tasks = all.length - events
+    const doneCount = all.length - open.length
+    const busiest = [...future].sort((a, b) => load.get(b)! - load.get(a)! || a.localeCompare(b))[0]
+    const facts = !all.length
+      ? 'На неделе пока ничего не запланировано.'
+      : [
+          `На неделе ${
+            events && tasks
+              ? `${plural(all.length, DELA)}: ${plural(events, SOBYTIYA)} и ${plural(tasks, ZADACHI)}`
+              : events
+                ? plural(events, SOBYTIYA)
+                : plural(tasks, ZADACHI)
+          }${doneCount ? `, выполнено ${doneCount}` : ''}.`,
+          load.get(busiest)! > 0 ? `Больше всего занят ${dayName(busiest)} (${hrs(load.get(busiest)!)}).` : '',
+          overdue.length ? `Просрочено: ${plural(overdue.length, ZADACHI)}.` : ''
+        ]
+          .filter(Boolean)
+          .join(' ')
+
+    // ---- список для модели ----
+    // короткие id (t1, t2…) только у задач, которые можно переносить
     const short = new Map<string, { item: Item; date: string }>()
-    let n = 0
     const tagName = (id: string): string => data.tags.find((t) => t.id === id)?.name ?? ''
-    const line = (item: Item, date: string, movable: boolean): string => {
-      const sid = `t${++n}`
-      if (movable) short.set(sid, { item, date })
+    const line = (item: Item, date: string, movable: boolean, extra = ''): string => {
+      let sid = ''
+      if (movable) {
+        sid = `t${short.size + 1}`
+        short.set(sid, { item, date })
+      }
       const parts = [
-        sid,
         item.type === 'event' ? 'событие' : 'задача',
         `«${item.title}»`,
+        extra,
         item.time ? (item.endTime ? `${item.time}–${item.endTime}` : item.time) : 'без времени',
         item.priority ? `приоритет ${['', 'низкий', 'средний', 'высокий'][item.priority]}` : '',
         item.tags.length ? `метки: ${item.tags.map(tagName).filter(Boolean).join(', ')}` : '',
         movable ? '' : 'нельзя переносить'
       ]
-      return '  - ' + parts.filter(Boolean).join(', ')
+      return `  - ${sid ? sid + ': ' : ''}${parts.filter(Boolean).join(', ')}`
     }
 
-    const loads: { date: string; minutes: number; count: number }[] = []
     const blocks: string[] = []
     for (const k of days) {
-      const list = occs.filter((o) => o.date === k && !o.done)
-      const mins = list.reduce((sum, o) => sum + durationOf(o.item), 0)
-      loads.push({ date: k, minutes: mins, count: list.length })
-      const d = fromKey(k)
-      const head = `${WD_SHORT[d.getDay()]} ${k}${k === today ? ' (сегодня)' : k < today ? ' (прошёл)' : ''}: ${list.length} дел, ≈${Math.round((mins / 60) * 10) / 10} ч`
-      const rows = list.map((o) =>
-        line(o.item, k, k >= today && !isRecurring(o.item) && o.item.type === 'task')
-      )
+      if (k < today) {
+        blocks.push(`${dayFull(k)} (прошёл)`)
+        continue
+      }
+      const list = open.filter((o) => o.date === k)
+      const head = `${dayFull(k)}${k === today ? ' (сегодня)' : ''}: ${list.length ? `${plural(list.length, DELA)}, ${hrs(load.get(k)!)}` : 'свободно'}`
+      const rows = list.map((o) => line(o.item, k, !isRecurring(o.item) && o.item.type === 'task'))
       blocks.push([head, ...rows].join('\n'))
     }
-
-    const overdue = data.items.filter((i) => !isRecurring(i) && i.date && i.date < today && !i.done && i.type === 'task')
     const overdueBlock = overdue.length
-      ? ['Просроченные задачи (из прошлого):', ...overdue.slice(0, 15).map((i) => line(i, i.date!, true))].join('\n')
+      ? ['Просроченные задачи:', ...overdue.slice(0, 15).map((i) => line(i, i.date!, true, `была на ${dayFull(i.date!)}`))].join('\n')
       : ''
 
-    const future = loads.filter((l) => l.date >= today)
-    if (!future.length) throw new AiError('Эта неделя уже прошла — откройте текущую или следующую')
     if (!short.size) {
-      return { summary: 'На этой неделе нет задач, которые можно переносить.', suggestions: [] }
+      return { summary: `${facts}${all.length ? ' Задач, которые можно переносить, нет.' : ''}`, suggestions: [] }
     }
-    const busiest = [...future].sort((a, b) => b.minutes - a.minutes)[0]
-    const freest = [...future].sort((a, b) => a.minutes - b.minutes).slice(0, 2)
-    const hint = `Подсказка: самый загруженный день ${busiest.date} (≈${Math.round(busiest.minutes / 6) / 10} ч), самые свободные: ${freest
-      .map((l) => `${l.date} (≈${Math.round(l.minutes / 6) / 10} ч)`)
-      .join(', ')}.`
 
-    const system = `Ты — помощник по планированию недели. Отвечай только JSON по схеме, по-русски.
-Цель: выровнять нагрузку и не терять просроченное.
-Правила:
-- summary: 1–2 коротких предложения об общей картине недели.
-- moves: до 5 переносов. id — только из списка с пометкой t1, t2… и без пометки «нельзя переносить». to — дата YYYY-MM-DD из этой недели, не раньше ${today}, и не та же, что сейчас. Переноси с перегруженных дней на свободные; просроченные — на ближайшие свободные дни; задачи с высоким приоритетом — пораньше.
-- reason: почему, одним коротким предложением.
-- tips: 0–3 коротких практичных совета. Не выдумывай задачи, которых нет в списке.
-- Если неделя сбалансирована — moves пустой.`
-    const user = [`Неделя ${days[0]} — ${days[6]}. Сегодня ${today}.`, ...blocks, overdueBlock, hint].filter(Boolean).join('\n\n')
+    const busy = future.filter((k) => count.get(k)! >= BUSY_COUNT || load.get(k)! > BUSY_MINUTES)
+    const light = !busy.length && !overdue.length
+    const freest = [...future].sort((a, b) => load.get(a)! - load.get(b)! || a.localeCompare(b)).slice(0, 2)
+    const hint = light
+      ? 'Загруженных дней и просроченных задач нет — переносы не нужны.'
+      : [
+          busy.length
+            ? `Загруженные дни: ${busy.map((k) => `${dayFull(k)} (${plural(count.get(k)!, DELA)}, ${hrs(load.get(k)!)})`).join('; ')}.`
+            : 'Загруженных дней нет.',
+          overdue.length ? 'Просроченные задачи поставь на ближайшие свободные дни.' : '',
+          `Свободнее всего: ${freest.map((k) => `${dayFull(k)} (${hrs(load.get(k)!)})`).join(', ')}.`
+        ]
+          .filter(Boolean)
+          .join(' ')
 
-    const out = await chatJSON<{ summary: string; moves: { id: string; to: string; reason: string }[]; tips: string[] }>(
+    const system = [
+      'Ты — помощник по планированию недели. Отвечай только JSON по схеме, по-русски.',
+      'Правила:',
+      '- comment: одна короткая фраза — общая оценка недели (например: «Неделя спокойная, есть запас времени»). Не перечисляй дела, не называй дни и не считай дела — сводку пользователь уже видит.',
+      light
+        ? ''
+        : '- moves: до 5 переносов, только если они разгружают загруженные дни или ставят просроченные задачи на свободные дни. id — номер задачи (t1, t2…) из списка; to — код дня (пн, вт, ср, чт, пт, сб, вс), куда перенести. Не переноси на день, где дел столько же или больше, чем в исходном. Если переносить нечего — moves пустой.',
+      light ? '' : '- reason: зачем перенос, одним коротким предложением, без названий дней и дат.',
+      '- tips: 0–3 коротких практичных совета по этой неделе. Не выдумывай дела, которых нет в списке.'
+    ]
+      .filter(Boolean)
+      .join('\n')
+    const user = [
+      `Неделя ${dayFull(days[0])} — ${dayFull(days[6])}. Сегодня ${dayFull(today)}.`,
+      ...blocks,
+      overdueBlock,
+      facts,
+      hint
+    ]
+      .filter(Boolean)
+      .join('\n\n')
+
+    const codeToDate = new Map(future.map((k) => [WD_SHORT[fromKey(k).getDay()], k]))
+    const out = await chatJSON<{ comment: string; moves?: { id: string; to: string; reason: string }[]; tips: string[] }>(
       system,
       user,
-      PLAN_SCHEMA,
-      600
+      planSchema(light ? null : [...short.keys()], [...codeToDate.keys()]),
+      light ? 300 : 600
     )
 
+    // ---- проверка переносов: только те, что реально помогают ----
     const suggestions: AiWeekSuggestion[] = []
     const used = new Set<string>()
-    for (const m of Array.isArray(out.moves) ? out.moves : []) {
+    for (const m of !light && Array.isArray(out.moves) ? out.moves : []) {
       const ref = short.get(String(m.id).trim())
-      const to = validDate(m.to)
-      if (!ref || !to || used.has(ref.item.id)) continue
-      if (!days.includes(to) || to < today || to === ref.date) continue
+      const to = codeToDate.get(String(m.to).trim().toLowerCase())
+      if (!ref || !to || used.has(ref.item.id) || to === ref.date) continue
+      const dur = durationOf(ref.item)
+      const wasOverdue = ref.date < today
+      const fromLoad = wasOverdue ? 0 : load.get(ref.date)!
+      const toLoad = load.get(to)!
+      const earlierHigh = ref.item.priority === 3 && to < ref.date && toLoad + dur <= fromLoad
+      const helps = wasOverdue || toLoad + dur < fromLoad || earlierHigh
+      if (!helps) continue
       used.add(ref.item.id)
-      suggestions.push({
-        kind: 'move',
-        itemId: ref.item.id,
-        title: ref.item.title,
-        fromDate: ref.date,
-        toDate: to,
-        text: String(m.reason ?? '').trim().slice(0, 200)
-      })
+      load.set(to, toLoad + dur)
+      if (!wasOverdue) load.set(ref.date, fromLoad - dur)
+
+      const reason = String(m.reason ?? '').trim()
+      const text =
+        reason && !DAY_MENTION.test(reason)
+          ? sentence(reason.slice(0, 200))
+          : wasOverdue
+            ? `Задача просрочена с ${dayFull(ref.date)} — ставим на свободный день.`
+            : toLoad + dur < fromLoad
+              ? `Исходный день загружен сильнее: ${hrs(fromLoad)} против ${hrs(toLoad)}.`
+              : 'Высокий приоритет — лучше сделать пораньше.'
+      suggestions.push({ kind: 'move', itemId: ref.item.id, title: ref.item.title, fromDate: ref.date, toDate: to, text })
     }
     for (const tip of Array.isArray(out.tips) ? out.tips.slice(0, 3) : []) {
       const text = String(tip).trim().slice(0, 200)
       if (text) suggestions.push({ kind: 'tip', text })
     }
-    return { summary: String(out.summary ?? '').trim().slice(0, 400), suggestions }
+
+    let comment = sentence(String(out.comment ?? '').slice(0, 200))
+    if (DAY_MENTION.test(comment) || COUNT_MENTION.test(comment)) comment = ''
+    if (!comment && light) comment = 'Загруженных дней нет.'
+    return { summary: [facts, comment].filter(Boolean).join(' ').slice(0, 500), suggestions }
   })
 }
 

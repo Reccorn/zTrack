@@ -25,7 +25,7 @@ function onKey(e: KeyboardEvent): void {
     e.preventDefault()
     titleBar.value?.focusSearch()
   } else if (!editor.open && !confirmState.open && e.altKey && /^Digit[1-6]$/.test(e.code)) {
-    const views = ['today', 'upcoming', 'inbox', 'all', 'calendar', 'done'] as const
+    const views = ['today', 'calendar', 'upcoming', 'inbox', 'all', 'done'] as const
     ui.view = views[Number(e.code.slice(5)) - 1]
     e.preventDefault()
   }

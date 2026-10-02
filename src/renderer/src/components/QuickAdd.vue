@@ -41,6 +41,15 @@ const text = ref('')
 const focused = ref(false)
 const parsed = computed(() => parseQuick(text.value, today.value))
 
+/** образец быстрого набора — при фокусе показываем его вместо обычного плейсхолдера (в узкой колонке недели не влезает) */
+const SAMPLE = '«завтра 18:30 !2 #дом»'
+const placeholderText = computed(() => {
+  if (recording.value) return `Говорите… 0:${String(recSeconds.value).padStart(2, '0')}  ·  Enter — готово, Esc — отмена`
+  if (transcribing.value) return 'Расшифровываю…'
+  if (focused.value && !props.compact) return SAMPLE
+  return props.placeholder ?? 'Добавить задачу…'
+})
+
 async function build(): Promise<Partial<Item> | null> {
   const p = parsed.value
   if (!p.title) return null
@@ -174,9 +183,7 @@ async function submit(e: KeyboardEvent): Promise<void> {
     <input
       ref="input"
       v-model="text"
-      :placeholder="
-        recording ? `Говорите… 0:${String(recSeconds).padStart(2, '0')}  ·  Enter — готово, Esc — отмена` : transcribing ? 'Расшифровываю…' : (placeholder ?? 'Добавить задачу…')
-      "
+      :placeholder="placeholderText"
       spellcheck="true"
       @focus="focused = true"
       @blur="onBlur"
@@ -184,18 +191,6 @@ async function submit(e: KeyboardEvent): Promise<void> {
       @keydown.enter="onEnter"
       @keydown.esc.stop="onEsc"
     />
-    <button
-      v-if="voiceOn && !text.trim() && !aiBusy"
-      class="mic"
-      :class="{ rec: recording, busy: transcribing }"
-      :style="{ '--lvl': recLevel }"
-      :disabled="transcribing"
-      :title="recording ? 'Закончить запись (Enter)' : 'Надиктовать задачу голосом (до 30 с)'"
-      @mousedown.prevent
-      @click="toggleMic"
-    >
-      <Icon :name="recording ? 'stop' : 'mic'" :size="14" />
-    </button>
     <button
       v-if="aiOn && text.trim() && !aiBusy"
       class="ai"
@@ -216,17 +211,32 @@ async function submit(e: KeyboardEvent): Promise<void> {
       <span v-for="t in parsed.tags" :key="t" class="chip">
         <span class="dot" :style="{ background: state.data.tags.find((x) => x.name.toLowerCase() === t.toLowerCase())?.color ?? 'var(--muted)' }" />{{ t }}
       </span>
-      <span class="kbd">Enter</span>
+      <span class="kbd wide-only">Enter</span>
     </div>
-    <div class="hints help" v-else-if="focused && !compact && !recording && !transcribing">
-      «завтра 18:30 !2 #дом» · <span class="kbd">Ctrl Enter</span> — подробно<template v-if="aiOn">
+    <!-- образец набора — в плейсхолдере; здесь только клавиши, и только если поле достаточно широкое -->
+    <div class="hints help wide-only" v-else-if="focused && !compact && !recording && !transcribing">
+      <span class="kbd">Ctrl Enter</span> — подробно<template v-if="aiOn">
         · <span class="kbd">Alt Enter</span> — ИИ</template>
     </div>
+    <button
+      v-if="voiceOn && !text.trim() && !aiBusy"
+      class="mic"
+      :class="{ rec: recording, busy: transcribing }"
+      :style="{ '--lvl': recLevel }"
+      :disabled="transcribing"
+      :title="recording ? 'Закончить запись (Enter)' : 'Надиктовать задачу голосом (до 30 с)'"
+      @mousedown.prevent
+      @click="toggleMic"
+    >
+      <Icon :name="recording ? 'stop' : 'mic'" :size="compact ? 14 : 16" :stroke="2.2" />
+    </button>
   </div>
 </template>
 
 <style scoped>
 .quick {
+  /* ширина поля доступна подсказкам через @container: в боковой панели дня (320 px) клавиши скрываются */
+  container-type: inline-size;
   display: flex;
   align-items: center;
   gap: 10px;
@@ -272,17 +282,25 @@ async function submit(e: KeyboardEvent): Promise<void> {
 .mic {
   --lvl: 0;
   flex: none;
-  width: 28px;
-  height: 28px;
+  width: 30px;
+  height: 30px;
+  margin-right: -4px;
   border-radius: 50%;
   display: grid;
   place-items: center;
-  color: var(--muted);
+  color: var(--accent-text);
+  background: var(--accent-soft);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 40%, transparent);
   transition: background 0.12s, color 0.12s, box-shadow 0.1s;
 }
 .mic:hover {
-  color: var(--accent-text);
-  background: var(--accent-soft);
+  color: #fff;
+  background: var(--accent);
+}
+.quick.compact .mic {
+  width: 26px;
+  height: 26px;
+  margin-right: -3px;
 }
 .mic.rec {
   color: #fff;
@@ -332,5 +350,10 @@ input::placeholder {
 .help {
   font-size: 12px;
   color: var(--muted);
+}
+@container (max-width: 540px) {
+  .wide-only {
+    display: none;
+  }
 }
 </style>
