@@ -1,0 +1,34 @@
+appId: com.ztrack.app
+productName: zTrack
+copyright: zTrack
+directories:
+  output: dist
+  buildResources: build
+files:
+  - out/**
+  - resources/**
+  - package.json
+  - '!**/*.map'
+asarUnpack:
+  - resources/**
+win:
+  target:
+    - target: nsis
+      arch: [x64]
+    - target: portable
+      arch: [x64]
+  icon: build/icon.ico
+  executableName: zTrack
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: always
+  createStartMenuShortcut: true
+  shortcutName: zTrack
+  uninstallDisplayName: zTrack
+  artifactName: zTrack-Setup-${version}.${ext}
+  deleteAppDataOnUninstall: false
+portable:
+  artifactName: zTrack-Portable-${version}.${ext}
+npmRebuild: false

@@ -1,0 +1,20 @@
+# зависимости и результаты сборки
+node_modules/
+out/
+dist/
+*.zip
+
+# логи, локальные настройки и секреты
+*.log
+.env
+.env.*
+.vscode/
+.idea/
+
+# системные файлы
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# файлы, которые сохраняет Claude в папку проекта
+Claude outputs/

@@ -1,0 +1,5 @@
+# единые переводы строк: LF в репозитории, .bat — CRLF при выгрузке (иначе cmd.exe ломает метки)
+* text=auto eol=lf
+*.bat text eol=crlf
+*.png binary
+*.ico binary

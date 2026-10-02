@@ -1,0 +1,28 @@
+{
+  "name": "ztrack",
+  "productName": "zTrack",
+  "version": "1.2.0",
+  "description": "zTrack — личный таск-трекер с календарём",
+  "author": "zTrack",
+  "private": true,
+  "main": "./out/main/index.js",
+  "scripts": {
+    "dev": "electron-vite dev",
+    "typecheck": "vue-tsc --noEmit -p tsconfig.web.json && tsc --noEmit -p tsconfig.node.json",
+    "build": "electron-vite build",
+    "build:win": "electron-vite build && electron-builder --win --x64",
+    "build:dir": "electron-vite build && electron-builder --win --x64 --dir",
+    "start": "electron-vite preview"
+  },
+  "devDependencies": {
+    "@types/node": "^22.19.0",
+    "@vitejs/plugin-vue": "^6.0.9",
+    "electron": "^44.5.1",
+    "electron-builder": "^26.15.3",
+    "electron-vite": "^5.0.0",
+    "typescript": "~5.9.3",
+    "vite": "^7.3.6",
+    "vue": "^3.5.43",
+    "vue-tsc": "^3.3.11"
+  }
+}
