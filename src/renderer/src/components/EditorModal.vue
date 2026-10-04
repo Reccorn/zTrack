@@ -2,10 +2,12 @@
 import { computed, nextTick, ref, watch } from 'vue'
 import Icon from './Icon.vue'
 import Toggle from './Toggle.vue'
-import { aiOn, api, closeEditor, createTag, deleteOcc, editor, saveItem, state, today, toast, toggleOcc } from '../store'
-import { PRIORITIES, REMINDER_OPTIONS, WD_SHORT, hhmm, minutesOf, recurrenceLabel, dayMonth, uid } from '../fmt'
+import { aiOn, api, closeEditor, createTag, deleteOcc, editor, saveItem, settings, state, today, toast, toggleOcc } from '../store'
+import { PRIORITIES, REMINDER_OPTIONS, WD_SHORT, hhmm, minutesOf, recurrenceLabel, dayMonth, shortDate, uid } from '../fmt'
 import { isRecurring, makeOcc, addDays } from '@shared/recurrence'
-import type { Item, RepeatFreq } from '@shared/types'
+import { parseQuick, type Parsed } from '../parse'
+import { useVoice } from '../useVoice'
+import type { AiDraft, Item, RepeatFreq } from '@shared/types'
 
 const titleInput = ref<HTMLTextAreaElement | null>(null)
 const error = ref('')
@@ -32,9 +34,18 @@ const allDay = computed({
 watch(
   () => editor.open,
   async (open) => {
-    if (!open) return
+    if (!open) {
+      // форму закрыли во время записи/расшифровки/разбора — результат больше не нужен
+      voice.cancel()
+      parseGen++
+      parseBusy.value = false
+      return
+    }
     error.value = ''
     addingTag.value = false
+    quickNewTags.value = []
+    skipShift = false
+    newStep.value = ''
     await nextTick()
     titleInput.value?.focus()
     autoGrow()
@@ -54,6 +65,11 @@ watch(
 watch(
   () => it.value?.time,
   (t, prev) => {
+    // время и конец выставлены вместе (быстрый набор / ИИ) — конец уже правильный
+    if (skipShift) {
+      skipShift = false
+      return
+    }
     if (!editor.open || !t || !prev || !it.value.endTime) return
     const dur = minutesOf(it.value.endTime) - minutesOf(prev)
     if (dur > 0) it.value.endTime = hhmm(minutesOf(t) + dur)
@@ -65,6 +81,167 @@ function autoGrow(): void {
   if (!el) return
   el.style.height = 'auto'
   el.style.height = el.scrollHeight + 'px'
+}
+
+// ---------- название новой задачи: быстрый набор, разбор ИИ, голос ----------
+const titleFocused = ref(false)
+/** метки из «#метка», которых ещё нет: создаются только при сохранении, чтобы после «Отмены» не оставалось лишних */
+const quickNewTags = ref<string[]>([])
+const parseBusy = ref(false)
+let parseGen = 0
+let skipShift = false
+
+/** что распознано в названии прямо сейчас — для чипов под полем */
+const quick = computed(() => (editor.open && editor.isNew && editor.item ? parseQuick(it.value.title, today.value) : null))
+const wordy = computed(() => it.value.title.trim().split(/\s+/).length >= 5)
+
+const voiceOn = computed(() => aiOn.value && settings.value.aiVoice)
+const voice = useVoice(async (t) => {
+  if (!editor.open || !editor.isNew) return
+  it.value.title = t
+  await nextTick()
+  autoGrow()
+  await aiParse()
+})
+const { recording, seconds: recSeconds, level: recLevel, transcribing } = voice
+const inputBusy = computed(() => recording.value || transcribing.value || parseBusy.value)
+
+const titlePlaceholder = computed(() => {
+  if (recording.value) return `Говорите… 0:${String(recSeconds.value).padStart(2, '0')}  ·  Enter — готово, Esc — отмена`
+  if (transcribing.value) return 'Расшифровываю…'
+  return it.value.type === 'task' ? 'Что нужно сделать?' : 'Название события'
+})
+
+function findTag(name: string): { id: string; color: string } | undefined {
+  return state.data.tags.find((t) => t.name.toLowerCase() === name.toLowerCase())
+}
+
+function addTagByName(name: string): void {
+  const t = findTag(name)
+  if (t) {
+    if (!it.value.tags.includes(t.id)) it.value.tags.push(t.id)
+  } else if (!quickNewTags.value.some((n) => n.toLowerCase() === name.toLowerCase())) {
+    quickNewTags.value.push(name)
+  }
+}
+
+function removeQuickTag(name: string): void {
+  quickNewTags.value = quickNewTags.value.filter((n) => n !== name)
+}
+
+/** выставить начало и конец разом, без автосдвига конца */
+function setTimes(time: string | null, endTime: string | null): void {
+  if (it.value.time !== time) skipShift = true
+  it.value.time = time
+  it.value.endTime = endTime
+}
+
+/** время из быстрого набора: без даты — на сегодня; у события сохраняем длительность (или час) */
+function applyTime(t: string): void {
+  const item = it.value
+  if (!item.date) setDate(today.value)
+  let end: string | null = null
+  if (item.type === 'event') {
+    const dur = item.time && item.endTime ? minutesOf(item.endTime) - minutesOf(item.time) : 0
+    end = hhmm(minutesOf(t) + (dur > 0 ? dur : 60))
+  }
+  setTimes(t, end)
+}
+
+function applyParsed(p: Parsed, withTitle: boolean): void {
+  if (withTitle) it.value.title = p.title
+  if (p.date) setDate(p.date)
+  if (p.time) applyTime(p.time)
+  if (p.priority) it.value.priority = p.priority
+  for (const n of p.tags) addTagByName(n)
+}
+
+/** «завтра 18:30 !2 #дом» в названии → поля формы (при уходе из названия и при сохранении) */
+function applyQuick(): void {
+  if (!editor.open || !editor.isNew || inputBusy.value) return
+  const p = parseQuick(it.value.title, today.value)
+  if (!p.hints.length) return
+  applyParsed(p, true)
+  nextTick(autoGrow)
+}
+
+function onTitleBlur(): void {
+  titleFocused.value = false
+  // переключились в другое окно — недописанный текст не трогаем
+  if (!document.hasFocus()) return
+  applyQuick()
+}
+
+/** ответ ИИ → поля формы; то, о чём модель не сказала, остаётся как было */
+function mergeDraft(d: AiDraft): void {
+  const item = it.value
+  const a = d.item
+  if (a.title) item.title = a.title
+  if (a.notes) item.notes = item.notes.trim() ? `${item.notes.trimEnd()}\n${a.notes}` : a.notes
+  if (a.type === 'event') item.type = 'event'
+  // без названной даты ИИ возвращает текущую дату формы (contextDate)
+  if (a.date !== undefined) setDate(a.date ?? '')
+  if (a.time && item.date) setTimes(a.time, item.type === 'event' ? (a.endTime ?? hhmm(minutesOf(a.time) + 60)) : null)
+  if (a.priority) item.priority = a.priority
+  if (a.reminder !== undefined && a.reminder !== state.data.settings.defaultReminder) item.reminder = a.reminder
+  if (a.recurrence && item.date) item.recurrence = { ...a.recurrence, weekdays: [...a.recurrence.weekdays] }
+  for (const id of a.tags ?? []) if (!item.tags.includes(id)) item.tags.push(id)
+  for (const n of d.newTags) {
+    if (!editor.aiNewTags.some((x) => x.toLowerCase() === n.toLowerCase())) editor.aiNewTags.push(n)
+  }
+  editor.aiFilled = true
+}
+
+/** разобрать введённый (или надиктованный) текст локальным ИИ и заполнить форму */
+async function aiParse(): Promise<void> {
+  if (!editor.open || !editor.isNew || !aiOn.value || parseBusy.value) return
+  const raw = it.value.title.replace(/\s+/g, ' ').trim()
+  if (!raw) return
+  const id = it.value.id
+  const my = ++parseGen
+  parseBusy.value = true
+  const r = await api.aiParseTask(raw, it.value.date)
+  if (my !== parseGen) return
+  parseBusy.value = false
+  if (!editor.open || editor.item?.id !== id) return
+  if (!r.ok) {
+    toast(r.error, undefined, 7000)
+    return
+  }
+  mergeDraft(r.data)
+  // точные токены быстрого набора важнее догадок модели
+  const local = parseQuick(raw, today.value)
+  if (local.hints.length) applyParsed(local, false)
+  // если модель оставила «завтра», «!2» и т. п. в названии — убираем
+  const rest = parseQuick(it.value.title, today.value)
+  if (rest.hints.length && rest.title) it.value.title = rest.title
+  editor.aiNewTags = editor.aiNewTags.filter((n) => !quickNewTags.value.some((q) => q.toLowerCase() === n.toLowerCase()))
+  await nextTick()
+  autoGrow()
+  titleInput.value?.focus()
+}
+
+function toggleMic(): void {
+  if (!recording.value && (parseBusy.value || transcribing.value)) return
+  void voice.toggle()
+}
+
+function onTitleEnter(e: KeyboardEvent): void {
+  if (e.isComposing) return
+  if (recording.value) {
+    e.preventDefault()
+    void voice.finish()
+    return
+  }
+  if (e.altKey) {
+    e.preventDefault()
+    void aiParse()
+    return
+  }
+  // Ctrl+Enter — общий обработчик формы; Shift+Enter — перенос строки, как раньше
+  if (e.ctrlKey || e.metaKey || e.shiftKey) return
+  e.preventDefault()
+  void save()
 }
 
 const freq = computed({
@@ -126,6 +303,9 @@ async function commitTag(): Promise<void> {
 // ---------- шаги (подзадачи) ----------
 const newStep = ref('')
 const aiBusy = ref(false)
+const stepFocused = ref(false)
+/** подсказка «Enter — добавить» в поле нового шага */
+const stepHint = computed(() => stepFocused.value || !!newStep.value.trim())
 
 function addStep(): void {
   const t = newStep.value.replace(/\s+/g, ' ').trim()
@@ -172,6 +352,8 @@ function setDate(v: string): void {
 }
 
 async function save(): Promise<void> {
+  if (inputBusy.value) return
+  applyQuick()
   const item = it.value
   item.title = item.title.replace(/\s+/g, ' ').trim()
   if (!item.title) {
@@ -198,6 +380,12 @@ async function save(): Promise<void> {
     item.time = null
     item.endTime = null
   }
+  // новые метки из «#метка» — только сейчас, когда задача точно сохраняется
+  for (const name of quickNewTags.value) {
+    const t = await createTag(name)
+    if (!item.tags.includes(t.id)) item.tags.push(t.id)
+  }
+  quickNewTags.value = []
   await saveItem(item)
   closeEditor()
 }
@@ -224,7 +412,9 @@ const isDoneNow = computed(() => {
 function onKey(e: KeyboardEvent): void {
   if (e.key === 'Escape') {
     e.stopPropagation()
-    closeEditor()
+    // Esc во время записи — отменить запись, а не закрыть форму
+    if (recording.value) voice.cancel()
+    else closeEditor()
   } else if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
     e.preventDefault()
     save()
@@ -265,15 +455,66 @@ const quickDates = computed(() => [
           </div>
 
           <div class="scroll">
-            <textarea
-              ref="titleInput"
-              v-model="it.title"
-              class="title-input"
-              rows="1"
-              :placeholder="it.type === 'task' ? 'Что нужно сделать?' : 'Название события'"
-              @input="autoGrow(); error = ''"
-              @keydown.enter.exact.prevent="save"
-            />
+            <div class="title-row">
+              <textarea
+                ref="titleInput"
+                v-model="it.title"
+                class="title-input"
+                rows="1"
+                :placeholder="titlePlaceholder"
+                :readonly="inputBusy"
+                @input="autoGrow(); error = ''"
+                @focus="titleFocused = true"
+                @blur="onTitleBlur"
+                @keydown.enter="onTitleEnter"
+              />
+              <template v-if="editor.isNew">
+                <button
+                  v-if="aiOn && it.title.trim() && !inputBusy"
+                  class="title-ai"
+                  :class="{ hot: wordy }"
+                  title="Разобрать текст локальным ИИ и заполнить поля (Alt+Enter)"
+                  @mousedown.prevent
+                  @click="aiParse"
+                >
+                  <Icon name="sparkles" :size="14" />ИИ
+                </button>
+                <span v-if="parseBusy" class="title-busy"><Icon name="sparkles" :size="14" class="spin" />ИИ разбирает…</span>
+                <button
+                  v-if="voiceOn && (!it.title.trim() || recording) && !parseBusy"
+                  class="mic"
+                  :class="{ rec: recording, busy: transcribing }"
+                  :style="{ '--lvl': recLevel }"
+                  :disabled="transcribing"
+                  :title="recording ? 'Закончить запись (Enter)' : 'Надиктовать задачу голосом (до 30 с) — ИИ заполнит поля'"
+                  @mousedown.prevent
+                  @click="toggleMic"
+                >
+                  <Icon :name="recording ? 'stop' : 'mic'" :size="16" :stroke="2.2" />
+                </button>
+              </template>
+            </div>
+
+            <!-- подсказка быстрого набора / что распознано; место зарезервировано, чтобы форма не прыгала -->
+            <div v-if="editor.isNew" class="quick-row">
+              <template v-if="titleFocused && !inputBusy">
+                <template v-if="quick && quick.hints.length">
+                  <span v-if="quick.date" class="chip"><Icon name="calendar" :size="12" />{{ shortDate(quick.date, today) }}</span>
+                  <span v-if="quick.time" class="chip"><Icon name="clock" :size="12" />{{ quick.time }}</span>
+                  <span v-if="quick.priority" class="chip" :style="{ color: PRIORITIES[quick.priority].color }">
+                    <Icon name="flag" :size="12" />{{ PRIORITIES[quick.priority].label }}
+                  </span>
+                  <span v-for="t in quick.tags" :key="t" class="chip" :title="findTag(t) ? '' : 'Новая метка — создастся при сохранении'">
+                    <span class="dot" :style="{ background: findTag(t)?.color ?? 'var(--muted)' }" />{{ t }}
+                  </span>
+                  <span class="muted"><span class="kbd">Tab</span> — разнести по полям</span>
+                </template>
+                <template v-else>
+                  <span class="muted">Быстрый набор: «завтра 18:30 !2 #дом»</span>
+                  <span v-if="aiOn" class="muted">· <span class="kbd">Alt Enter</span> — разобрать ИИ</span>
+                </template>
+              </template>
+            </div>
 
             <div v-if="editor.aiFilled" class="ai-banner">
               <Icon name="sparkles" :size="14" />
@@ -411,6 +652,15 @@ const quickDates = computed(() => [
                   @blur="commitTag"
                 />
                 <button v-else class="tag-chip add" @click="startTag"><Icon name="plus" :size="12" />Метка</button>
+                <button
+                  v-for="n in quickNewTags"
+                  :key="'new:' + n"
+                  class="tag-chip on pending"
+                  title="Новая метка — создастся при сохранении. Нажмите, чтобы убрать"
+                  @click="removeQuickTag(n)"
+                >
+                  <Icon name="plus" :size="12" />{{ n }}
+                </button>
               </div>
 
               <!-- Шаги -->
@@ -424,7 +674,19 @@ const quickDates = computed(() => [
                   <button class="icon-btn step-del" title="Удалить шаг" @click="removeStep(i)"><Icon name="x" :size="13" /></button>
                 </div>
                 <div class="step-add">
-                  <input v-model="newStep" class="input" placeholder="Добавить шаг…" maxlength="200" @keydown.enter.prevent.stop="addStep" />
+                  <div class="step-input">
+                    <input
+                      v-model="newStep"
+                      class="input"
+                      :class="{ 'with-hint': stepHint }"
+                      placeholder="Добавить шаг…"
+                      maxlength="200"
+                      @focus="stepFocused = true"
+                      @blur="stepFocused = false"
+                      @keydown.enter.prevent.stop="addStep"
+                    />
+                    <span v-if="stepHint" class="step-hint" :class="{ ready: newStep.trim() }"><span class="kbd">Enter</span> — добавить</span>
+                  </div>
                   <button v-if="aiOn" class="btn sm ai-btn" :disabled="aiBusy" title="Локальный ИИ предложит шаги" @click="aiSteps">
                     <Icon name="sparkles" :size="14" :class="{ spin: aiBusy }" />{{ aiBusy ? 'Думаю…' : 'Разбить на шаги' }}
                   </button>
@@ -445,7 +707,7 @@ const quickDates = computed(() => [
             <span class="spacer" />
             <span class="kbd">Ctrl Enter</span>
             <button class="btn" @click="closeEditor">Отмена</button>
-            <button class="btn primary" @click="save">{{ editor.isNew ? 'Создать' : 'Сохранить' }}</button>
+            <button class="btn primary" :disabled="inputBusy" @click="save">{{ editor.isNew ? 'Создать' : 'Сохранить' }}</button>
           </div>
         </div>
       </Transition>
@@ -521,8 +783,122 @@ const quickDates = computed(() => [
   gap: 6px;
   align-items: center;
 }
-.step-add .input {
+.step-input {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+}
+.step-input .input {
   height: 32px;
+}
+.step-input .input.with-hint {
+  padding-right: 112px;
+}
+.step-hint {
+  position: absolute;
+  right: 10px;
+  top: 50%;
+  transform: translateY(-50%);
+  font-size: 12px;
+  color: var(--muted);
+  white-space: nowrap;
+  pointer-events: none;
+  opacity: 0.55;
+  transition: opacity 0.12s;
+}
+.step-hint.ready {
+  opacity: 1;
+}
+.step-hint.ready .kbd {
+  color: var(--accent-text);
+  border-color: color-mix(in srgb, var(--accent) 50%, transparent);
+}
+.title-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+}
+.title-row .title-input {
+  flex: 1;
+  width: auto;
+  min-width: 0;
+}
+.title-ai,
+.title-busy,
+.mic {
+  flex: none;
+  margin-top: 5px;
+}
+.mic {
+  margin-top: 4px;
+}
+.title-ai {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 30px;
+  padding: 0 10px;
+  border-radius: 8px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted);
+  transition: background 0.12s, color 0.12s;
+}
+.title-ai:hover,
+.title-ai.hot {
+  color: var(--accent-text);
+  background: var(--accent-soft);
+}
+.title-busy {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 30px;
+  font-size: 12px;
+  color: var(--accent-text);
+  white-space: nowrap;
+}
+.mic {
+  --lvl: 0;
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  color: var(--accent-text);
+  background: var(--accent-soft);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 40%, transparent);
+  transition: background 0.12s, color 0.12s, box-shadow 0.1s;
+}
+.mic:hover {
+  color: #fff;
+  background: var(--accent);
+}
+.mic.rec {
+  color: #fff;
+  background: var(--danger);
+  box-shadow: 0 0 0 calc(2px + var(--lvl) * 8px) color-mix(in srgb, var(--danger) 30%, transparent);
+}
+.mic.busy {
+  animation: pulse 1s ease-in-out infinite;
+}
+@keyframes pulse {
+  50% {
+    opacity: 0.4;
+  }
+}
+.quick-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 6px;
+  min-height: 22px;
+  margin: 0 0 4px;
+  font-size: 12px;
+}
+.tag-chip.pending {
+  --c: var(--accent);
+  border-style: dashed;
 }
 .ai-btn {
   flex: none;

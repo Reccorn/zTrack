@@ -1,9 +1,9 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import Icon from './Icon.vue'
 import { parseQuick } from '../parse'
 import { aiOn, api, blankItem, createTag, openAiDraft, openNew, saveItem, settings, state, today, toast } from '../store'
-import { MAX_SECONDS, startRecording, type Recording } from '../voice'
+import { useVoice } from '../useVoice'
 import { PRIORITIES, shortDate } from '../fmt'
 import type { Item } from '@shared/types'
 
@@ -29,7 +29,7 @@ function onBlur(): void {
 
 function onEsc(): void {
   if (recording.value) {
-    cancelRecording()
+    voice.cancel()
     return
   }
   text.value = ''
@@ -89,72 +89,22 @@ async function aiSubmit(): Promise<void> {
 
 // ---------- голосовой ввод ----------
 const voiceOn = computed(() => aiOn.value && settings.value.aiVoice)
-const recording = ref<Recording | null>(null)
-const recSeconds = ref(0)
-const recLevel = ref(0)
-const transcribing = ref(false)
-let recTimer: number | undefined
-let recStarted = 0
-
-async function toggleMic(): Promise<void> {
-  if (recording.value) return finishRecording()
-  if (transcribing.value || aiBusy.value) return
-  try {
-    recording.value = await startRecording()
-  } catch (e) {
-    toast(e instanceof Error ? e.message : String(e), undefined, 7000)
-    return
-  }
-  recStarted = Date.now()
-  recSeconds.value = 0
-  recTimer = window.setInterval(() => {
-    recSeconds.value = Math.floor((Date.now() - recStarted) / 1000)
-    recLevel.value = recording.value?.level() ?? 0
-    if (recSeconds.value >= MAX_SECONDS) finishRecording()
-  }, 100)
-}
-
-function stopTimer(): void {
-  clearInterval(recTimer)
-  recLevel.value = 0
-}
-
-function cancelRecording(): void {
-  stopTimer()
-  recording.value?.cancel()
-  recording.value = null
-}
-
-async function finishRecording(): Promise<void> {
-  const rec = recording.value
-  if (!rec) return
-  stopTimer()
-  recording.value = null
-  transcribing.value = true
-  try {
-    const wav = await rec.stop()
-    const r = await api.aiTranscribe(wav)
-    if (!r.ok) {
-      toast(r.error, undefined, 7000)
-      return
-    }
-    text.value = r.data
-  } catch (e) {
-    toast(e instanceof Error ? e.message : String(e), undefined, 6000)
-    return
-  } finally {
-    transcribing.value = false
-  }
-  // сразу разбираем расшифровку в задачу — форма откроется для проверки
+// расшифровку сразу разбираем в задачу — форма откроется для проверки
+const voice = useVoice(async (t) => {
+  text.value = t
   await aiSubmit()
-}
+})
+const { recording, seconds: recSeconds, level: recLevel, transcribing } = voice
 
-onUnmounted(cancelRecording)
+function toggleMic(): void {
+  if (!recording.value && aiBusy.value) return
+  void voice.toggle()
+}
 
 function onEnter(e: KeyboardEvent): void {
   if (recording.value) {
     e.preventDefault()
-    finishRecording()
+    void voice.finish()
     return
   }
   if (e.altKey && aiOn.value) {
